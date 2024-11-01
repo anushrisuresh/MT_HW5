@@ -19,10 +19,10 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 EMB_SIZE = 512
 NHEAD = 8
 FFN_HID_DIM = 512
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 NUM_ENCODER_LAYERS = 3
 NUM_DECODER_LAYERS = 3
-NUM_EPOCHS = 100
+NUM_EPOCHS = 150
 
 # Dataset class
 class CustomSeq2SeqDataset(Dataset):
@@ -188,18 +188,18 @@ def translate(model: nn.Module, src_sentence: str, text_transform, vocab_transfo
     src = text_transform[SRC_LANGUAGE](src_sentence).view(-1, 1)
     num_tokens = src.shape[0]
     src_mask = (torch.zeros(num_tokens, num_tokens)).type(torch.bool)
-    tgt_tokens = beam_search_decode(model, src, src_mask, max_len=num_tokens + 5, start_symbol=BOS_IDX, beam_width=beam_width).flatten()
-    # tgt_tokens = greedy_decode(model, src, src_mask, max_len=num_tokens + 5, start_symbol=BOS_IDX).flatten() 
+    # tgt_tokens = beam_search_decode(model, src, src_mask, max_len=num_tokens + 5, start_symbol=BOS_IDX, beam_width=beam_width).flatten()
+    tgt_tokens = greedy_decode(model, src, src_mask, max_len=num_tokens + 5, start_symbol=BOS_IDX).flatten() 
     return " ".join(vocab_transform[TGT_LANGUAGE].lookup_tokens(list(tgt_tokens.cpu().numpy()))).replace("<bos>", "").replace("<eos>", "")
 
 
-def translate(model: nn.Module, src_sentence: str, text_transform, vocab_transform):
-    model.eval()
-    src = text_transform[SRC_LANGUAGE](src_sentence).view(-1, 1)
-    num_tokens = src.shape[0]
-    src_mask = (torch.zeros(num_tokens, num_tokens)).type(torch.bool)
-    tgt_tokens = greedy_decode(model, src, src_mask, max_len=num_tokens + 5, start_symbol=BOS_IDX).flatten()
-    return " ".join(vocab_transform[TGT_LANGUAGE].lookup_tokens(list(tgt_tokens.cpu().numpy()))).replace("<bos>", "").replace("<eos>", "")
+# def translate(model: nn.Module, src_sentence: str, text_transform, vocab_transform):
+#     model.eval()
+#     src = text_transform[SRC_LANGUAGE](src_sentence).view(-1, 1)
+#     num_tokens = src.shape[0]
+#     src_mask = (torch.zeros(num_tokens, num_tokens)).type(torch.bool)
+#     tgt_tokens = greedy_decode(model, src, src_mask, max_len=num_tokens + 5, start_symbol=BOS_IDX).flatten()
+#     return " ".join(vocab_transform[TGT_LANGUAGE].lookup_tokens(list(tgt_tokens.cpu().numpy()))).replace("<bos>", "").replace("<eos>", "")
 
 # Training and evaluation
 def train_epoch(model, optimizer, train_dataset, collate_fn):
