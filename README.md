@@ -17,7 +17,7 @@ Beam Search
 	•	Batch Size 32: Each epoch required around 55.2 seconds.
 	•	Batch Size 64: The training time improved to 42.1 seconds per epoch.
 
-The results of the training were evaluated using the BLEU score, where the model achieved a score of `5.31`. The final output is in the `translations` file.
+The results of the training were evaluated using the `BLEU` score, where the model achieved a score of `0.5314`. The final output is in the `translations` file.
 
 ### Usage
 
