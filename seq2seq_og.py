@@ -1,35 +1,37 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+This code is based on the tutorial by Sean Robertson <https://github.com/spro/practical-pytorch> found here:
+https://pytorch.org/tutorials/intermediate/seq2seq_translation_tutorial.html
+Students *MAY NOT* view the above tutorial or use it as a reference in any way.
+"""
+
 from __future__ import unicode_literals, print_function, division
 
-import argparse
-import logging
-import random
 import time
-from io import open
-
+import random
+import logging
+import argparse
 import matplotlib
+from io import open
+from tqdm import tqdm
 
 # if you are running on the gradx/ugradx/ another cluster,
 # you will need the following line
 # if you run on a local machine, you can comment it out
-matplotlib.use('agg')
+matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from nltk.translate.bleu_score import corpus_bleu
 from torch import optim
-from torch.autograd import Variable
-import numpy as np
 
 logging.basicConfig(level=logging.DEBUG,
                     format='%(asctime)s %(levelname)s %(message)s')
 
-# we are forcing the use of cpu, if you have access to a gpu, you can set the flag to "cuda"
-# make sure you are very careful if you are using a gpu on a shared cluster/grid,
-# it can be very easy to confict with other people's jobs.
-# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-device = torch.device("cuda")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 SOS_token = "<SOS>"
 EOS_token = "<EOS>"
@@ -39,17 +41,15 @@ EOS_index = 1
 MAX_LENGTH = 15
 
 
-# import genism
-
 class Vocab:
-    """ This class handles the mapping between the words and their indicies
+    """ This class handles the mapping between the words and their indices
     """
 
     def __init__(self, lang_code):
         self.lang_code = lang_code
         self.word2index = {}
         self.word2count = {}
-        self.index2word = {SOS_index: SOS_token, EOS_index: EOS_token}
+        self.index2word = {SOS_index: SOS_token, EOS_index: EOS_token}  
         self.n_words = 2  # Count SOS and EOS
 
     def add_sentence(self, sentence):
@@ -64,14 +64,6 @@ class Vocab:
             self.n_words += 1
         else:
             self.word2count[word] += 1
-
-
-# def get_pre_trained_embedding_mat(vocab, file, lan):
-#   embeddings = []
-#   model = gensim.models.KeyedVectors.load_word2vec_format(lan+"embeds")
-#   for word in vocab.word2index:
-#     embeddings.append(model.wv.get_vector(word, [0 for _ in range(100)]))
-#   return embeddings
 
 
 ######################################################################
@@ -94,7 +86,7 @@ def split_lines(input_file):
 
 
 def make_vocabs(src_lang_code, tgt_lang_code, train_file):
-    """ Creates the vocabs for each of the langues based on the training corpus.
+    """ Creates the vocabs for each of the languages based on the training corpus.
     """
     src_vocab = Vocab(src_lang_code)
     tgt_vocab = Vocab(tgt_lang_code)
@@ -116,17 +108,14 @@ def make_vocabs(src_lang_code, tgt_lang_code, train_file):
 def tensor_from_sentence(vocab, sentence):
     """creates a tensor from a raw sentence
     """
-    # indexes = []
-    tens = torch.ones(MAX_LENGTH, dtype=torch.long, device=device)
-    for i, word in enumerate(sentence.split()):
+    indexes = []
+    for word in sentence.split():
         try:
-            # indexes.append(vocab.word2index[word])
-            tens[i] = vocab.word2index[word]
+            indexes.append(vocab.word2index[word])
         except KeyError:
             pass
-            # logging.warn('skipping unknown subword %s. Joint BPE can produces subwords at test time which are not in vocab. As long as this doesnt happen every sentence, this is fine.', word)
-    tens[len(sentence.split())] = EOS_index
-    return tens.view(-1, 1)
+    indexes.append(EOS_index)
+    return torch.tensor(indexes, dtype=torch.long, device=device).view(-1, 1)
 
 
 def tensors_from_pair(src_vocab, tgt_vocab, pair):
@@ -137,214 +126,273 @@ def tensors_from_pair(src_vocab, tgt_vocab, pair):
     return input_tensor, target_tensor
 
 
+def sentence_indices(lang, sentence):
+    """
+    function to convert sentence from string to int based on the vocab indices
+    """
+    return [lang.word2index[word] for word in sentence.split(' ')] + [EOS_index]
+
+
 ######################################################################
-class LSTMCell(nn.Module):
-    def __init__(self, input_size, hidden_size, bias=True):
-        super(LSTMCell, self).__init__()
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.bias = bias
 
-        self.xh = nn.Linear(input_size, hidden_size * 4, bias=bias)
-        self.hh = nn.Linear(hidden_size, hidden_size * 4, bias=bias)
-        self.reset_parameters()
+def sequence_padding(seq, max_len, pad_const=1):
+    if len(seq) >= max_len:
+        return seq[:max_len]
 
-    def reset_parameters(self):
-        std = 1.0 / np.sqrt(self.hidden_size)
-        for w in self.parameters():
-            w.data.uniform_(-std, std)
+    padding = [pad_const] * (max_len - len(seq))
+    return seq + padding
 
-    def forward(self, input, hx):
-        hx, cx = hx
+def mini_batching(batch_size, sentence_pairs, i_vocab, t_vocab):
+    """
+    function to create mini batches out of the data using random shuffle
+    """
+    inp_seq = []
+    target_seq = []
 
-        gates = self.xh(input) + self.hh(hx)
+    sentence_pairs = list(random.sample(sentence_pairs, batch_size))
+    for input, output in sentence_pairs:
+        inp_seq.append(sentence_indices(i_vocab, input))
+        target_seq.append(sentence_indices(t_vocab, output))
 
-        # Get gates (i_t, f_t, g_t, o_t)
-        input_gate, forget_gate, cell_gate, output_gate = gates.chunk(4, 1)
+    # Sort the sequences by their length
+    seq_pairs = sorted(zip(inp_seq, target_seq), key=lambda x: len(x[0]), reverse=True)
+    inp_seq, target_seq = tuple(zip(*seq_pairs))
 
-        i_t = torch.sigmoid(input_gate)
-        f_t = torch.sigmoid(forget_gate)
-        g_t = torch.tanh(cell_gate)
-        o_t = torch.sigmoid(output_gate)
+    # Pad the input and target sequences
+    pad_input = []
+    for input_seq in inp_seq:
+        pad_input.append(sequence_padding(input_seq, MAX_LENGTH, EOS_index))
+    pad_target = []
+    for target_seq in target_seq:
+        pad_target.append(sequence_padding(target_seq, MAX_LENGTH, EOS_index))
 
-        cy = cx * f_t + i_t * g_t
+    # Convert the padded sequences to tensors
+    inp_seq = torch.Tensor(pad_input)
+    target_seq = torch.Tensor(pad_target)
 
-        hy = o_t * torch.tanh(cy)
-        return (hy, cy)
+    return inp_seq, target_seq
+
+
+######################################################################
 
 
 class EncoderRNN(nn.Module):
-    """the class for the enoder RNN
+    """the class for the encoder RNN
     """
 
-    def __init__(self, input_size, hidden_size):
+    def __init__(self, input_size, hidden_size, batch_size):
         super(EncoderRNN, self).__init__()
+        self.input_size = input_size
         self.hidden_size = hidden_size
-        self.embedding_dim = hidden_size
-        self.embedding = nn.Embedding(input_size, self.embedding_dim)
-        self.embedding_dropout = nn.Dropout(0.1)
-        self.lstm = LSTMCell(self.embedding_dim, self.hidden_size, bias=True)
+        self.batch_size = batch_size
 
-    def forward(self, input, hidden):
+        # Initializing the layers
+        self.embedding = nn.Embedding(input_size, hidden_size, padding_idx=EOS_index)
+        self.lstm = nn.LSTM(hidden_size, hidden_size, batch_first=True)  
+
+    def forward(self, input_batch, hidden, test=False):
         """runs the forward pass of the encoder
         returns the output and the hidden state
         """
-        "*** YOUR CODE HERE ***"
-        # print("Input: ", input.shape, hidden[0].shape, hidden[1].shape)
-        embeds = self.embedding_dropout(self.embedding(input.T))
-        # print(embeds.shape)
-        hidden, cell = self.lstm(embeds, hidden)
-        # print("Encoding done: ", hidden.shape, cell.shape)
-        return hidden, cell
+        if test:
+            cur_b_size = 1
+        else:
+            cur_b_size = self.batch_size
+
+        embedded = self.embedding(input_batch.long().to(device))
+        # Reshape the embedded tensor to [batch_size, 1, hidden_size]
+        embedded = embedded.view(cur_b_size, 1, -1)
+        lstm_output, hidden = self.lstm(embedded, hidden)
+        outputs = lstm_output
+
+        return outputs, hidden
+
 
     def get_initial_hidden_state(self):
-        return torch.zeros(1, self.hidden_size, device=device)
-
-
-class BahdanauAttention(nn.Module):
-    def __init__(self, hidden_size):
-        super(BahdanauAttention, self).__init__()
-        self.Wa = nn.Linear(hidden_size, hidden_size)
-        self.Ua = nn.Linear(hidden_size, hidden_size)
-        self.Va = nn.Linear(hidden_size, 1)
-
-    def forward(self, query, keys):
-        scores = self.Va(torch.tanh(self.Wa(query) + self.Ua(keys)))
-
-        # scores = scores.squeeze(2).unsqueeze(1)
-
-        weights = F.softmax(scores, dim=0)
-        # print("Attention: ", query.shape, keys.shape, scores, weights)
-        context = weights * keys
-        # print(context.shape, torch.sum(context, dim=0).unsqueeze(dim=1).shape, weights.shape, scores.shape)
-        return torch.sum(context, dim=0).unsqueeze(dim=0), weights
+        return None  
 
 
 class AttnDecoderRNN(nn.Module):
     """the class for the decoder
     """
 
-    def __init__(self, hidden_size, output_size, dropout_p=0.1, max_length=MAX_LENGTH):
+    def __init__(self, hidden_size, output_size, D, dropout_p=0.2, max_length=MAX_LENGTH):
         super(AttnDecoderRNN, self).__init__()
         self.hidden_size = hidden_size
         self.output_size = output_size
         self.dropout_p = dropout_p
         self.max_length = max_length
+        self.D = D
 
         self.dropout = nn.Dropout(self.dropout_p)
-        self.embedding = nn.Embedding(output_size, hidden_size)
-        self.attention = BahdanauAttention(hidden_size)
-        self.lstm = LSTMCell(2 * hidden_size, hidden_size)
 
+        self.softmax = nn.Softmax(dim=1)
+        self.relu = nn.ReLU()
+
+        self.embedding = nn.Embedding(self.output_size, self.hidden_size)
+        self.dropout = nn.Dropout(self.dropout_p)
+        self.lstm = nn.LSTM(self.hidden_size, self.hidden_size, dropout=dropout_p, batch_first=True)  
         self.out = nn.Linear(self.hidden_size, self.output_size)
+        self.attention = nn.Linear(self.hidden_size * 2, 2 * self.D + 1)
+        self.combine_attn = nn.Linear(self.hidden_size * 2, self.hidden_size)
 
-    def forward(self, input, hidden, cell, encoder_outputs):
+
+    def forward(self, input, hidden, encoder_outputs, window):
         """runs the forward pass of the decoder
         returns the log_softmax, hidden state, and attn_weights
 
         Dropout (self.dropout) should be applied to the word embeddings.
         """
 
-        embedded = self.dropout(self.embedding(input.squeeze(dim=0)))
-        # print("DECODER: ", input.shape, hidden.shape, embedded.shape, cell.shape, encoder_outputs.shape)
-        query = hidden
-        context, attn_weights = self.attention(query, encoder_outputs)
-        # print(embedded.shape, context.shape)
-        input_lstm = torch.cat((embedded.view(1, -1), context), dim=1)
-        # print(input_lstm.shape)
+        embedded = self.dropout(self.embedding(input))  
 
-        hidden, cell = self.lstm(input_lstm, (hidden, cell))
-        output = F.log_softmax(self.out(hidden))
-        return output, hidden, cell, attn_weights
+        attn_input = torch.cat((embedded[:, 0, :], hidden[0][0, :, :]), dim=1)
+        attn_logits = self.attention(attn_input)
+        attn_weights = self.softmax(attn_logits)
+        applied_attn = torch.bmm(attn_weights[:, window[0]:window[1]].unsqueeze(1), encoder_outputs)
+        output = torch.cat((embedded, applied_attn), 2)
+        output = self.relu(self.combine_attn(output))
+
+        output, hidden = self.lstm(output, hidden)
+        output = F.log_softmax(self.out(output[:, 0, :]), dim=1)
+
+        return output, hidden, attn_weights
+
 
     def get_initial_hidden_state(self):
-        return torch.zeros(1, self.hidden_size, device=device)
+        return None  
 
 
 ######################################################################
 
-def train(input_tensor, target_tensor, encoder, decoder, optimizer, criterion, max_length=MAX_LENGTH):
+def train(input_batch, target_batch, encoder, decoder, optimizer, criterion, w_size, max_length=MAX_LENGTH):
+    """
+    function to train the nn
+    """
     # make sure the encoder and decoder are in training mode so dropout is applied
     encoder.train()
     decoder.train()
 
-    input_length = input_tensor.size()[0]
-    # print("train: ", input_tensor.shape, target_tensor.shape, input_length)
+    # Initialize variables for training loop
     encoder_hidden = encoder.get_initial_hidden_state()
-    encoder_outputs = torch.zeros(max_length, encoder.hidden_size, device=device)
-    encoder_cell = encoder_hidden
-    for ei in range(input_length):
-        encoder_hidden, encoder_cell = encoder(input_tensor[ei],
-                                               (encoder_hidden, encoder_cell))
-        encoder_outputs[ei] += encoder_hidden.squeeze(0)
-    # print("ENCODER: ", encoder_hidden.shape, encoder_outputs.shape)
-
-    decoder_input = torch.tensor([[SOS_index]], device=device)
-    decoder_attentions = torch.zeros((MAX_LENGTH, MAX_LENGTH), dtype=torch.long, device=device)
-    decoder_hidden, decoder_cell = encoder_hidden, encoder_hidden
-    decoder_generated = torch.zeros(size=(max_length, decoder.output_size), device=device)
-
-    for di in range(max_length):
-        decoder_output, decoder_hidden, decoder_cell, decoder_attention = decoder(
-            decoder_input, decoder_hidden, decoder_cell, encoder_outputs)
-        # print(decoder_attention.shape)
-        decoder_attentions[di] = decoder_attention.T.data
-        topv, topi = decoder_output.data.topk(1)
-        decoder_generated[di] = decoder_output
-        if topi.item() == EOS_index:
-            break
-        decoder_input = topi.squeeze().detach()
-    # print(decoder_generated.shape, target_tensor.shape)
     optimizer.zero_grad()
-    loss = criterion(decoder_generated, target_tensor.view(-1))
+    loss = 0
+    start_time = time.time()
+
+    # Determine input and target lengths
+    input_len = input_batch[0].shape[0]
+    t_length = target_batch[0].shape[0]
+    batch_size = input_batch.shape[0]
+
+    # Initialize encoder outputs tensor
+    encoder_outputs = torch.zeros((batch_size, max_length, encoder.hidden_size), device=device)
+
+    # Iterate over the input sequence, processing each word at a time
+    for ei in range(input_len):
+        # Pass the current input word to the encoder
+        encoder_out, encoder_hidden = encoder(input_batch[:, ei].view(-1, 1), encoder_hidden)
+        encoder_outputs[:, ei, :] = encoder_out.squeeze(dim=1)
+
+    # Initialize the decoder input with the SOS index
+    decoder_inp = torch.tensor(SOS_index, device=device).view(1, 1).expand(batch_size, 1)
+
+    # Initialize the decoder hidden state with the final encoder hidden state
+    decoder_hidden = encoder_hidden
+
+    for i in range(t_length):
+        # Calculate the window boundaries and context window lengths
+        window_l = max(i - w_size, 0)
+        window_r = min(t_length, i + w_size + 1)
+        if window_l == 0:
+            l = 0 - (i - w_size)
+        else:
+            l = 0
+
+        if (i + w_size + 1) > t_length:
+            r = t_length - (i + w_size + 1)
+        else:
+            r = 2 * w_size + 1
+
+        # Extract relevant encoder outputs based on the window boundaries
+        relevant_encoder_outputs = encoder_outputs[:, window_l:window_r, :]
+        decoder_out, decoder_hidden, decoder_attention = decoder(decoder_inp, decoder_hidden,
+                                                                    relevant_encoder_outputs, (l, r))
+
+        # Obtain the top prediction from the decoder output
+        topv, topi = decoder_out.topk(1, dim=1)
+        decoder_inp = topi.squeeze().detach().reshape((-1, 1))
+
+        # Calculate the loss for the current step and add it to the accumulated loss
+        loss += criterion(decoder_out, target_batch[:, i].long().to(device))
+
+
     loss.backward()
     optimizer.step()
-    # print(loss.item())
+
+    target_lengths = [i.size(0) for i in target_batch]
+    total_length = sum(target_lengths)
+    batch_size = len(target_batch)
+    t_length = total_length / batch_size
+
+
     return loss.item()
 
 
 ######################################################################
 
-def translate(encoder, decoder, sentence, src_vocab, tgt_vocab, max_length=MAX_LENGTH):
+
+def translate(encoder, decoder, sentence, src_vocab, tgt_vocab, w_size, max_length=MAX_LENGTH):
     """
-    runs tranlsation, returns the output and attention
+    runs translation, returns the output and attention
     """
 
     # switch the encoder and decoder to eval mode so they are not applying dropout
     encoder.eval()
     decoder.eval()
 
+    batch_size = 1  
+
     with torch.no_grad():
         input_tensor = tensor_from_sentence(src_vocab, sentence)
-        input_length = input_tensor.size()[0]
+        input_len = input_tensor.size()[0]
         encoder_hidden = encoder.get_initial_hidden_state()
 
-        encoder_outputs = torch.zeros(max_length, encoder.hidden_size, device=device)
-        encoder_hidden, encoder_cell = encoder.get_initial_hidden_state(), encoder.get_initial_hidden_state()
-        for ei in range(input_length):
-            encoder_hidden, encoder_cell = encoder(input_tensor[ei],
-                                                   (encoder_hidden, encoder_cell))
-            encoder_outputs[ei] += encoder_hidden.squeeze(0)
+        encoder_outputs = torch.zeros(batch_size, max_length, encoder.hidden_size, device=device)
 
-        decoder_input = torch.tensor([[SOS_index]], device=device)
-
-        decoder_hidden, decoder_cell = encoder_hidden, encoder_hidden
+        for ei in range(input_len):
+            encoder_out, encoder_hidden = encoder(input_tensor[ei].reshape((-1, 1)), encoder_hidden, test=True)
+            encoder_outputs[:, ei, :] = encoder_out.squeeze(dim=1)
+        decoder_inp = torch.tensor([[SOS_index] * batch_size], device=device).reshape(-1, 1)
+        decoder_hidden = encoder_hidden  
 
         decoded_words = []
-        decoder_attentions = torch.zeros(max_length, max_length)
+        decoder_attentions = torch.zeros(max_length, 2 * w_size + 1)
 
         for di in range(max_length):
-            decoder_output, decoder_hidden, decoder_cell, decoder_attention = decoder(
-                decoder_input, decoder_hidden, decoder_cell, encoder_outputs)
-            decoder_attentions[di] = decoder_attention.T.data
-            topv, topi = decoder_output.data.topk(1)
+            window_l = max(di - w_size, 0)
+            l = 0
+            if window_l == 0:
+                l = 0 - (di - w_size)
+            else:
+                l = 0
+            window_r = min(max_length, di + w_size + 1)
+            r = 0
+            if di + w_size + 1 > max_length:
+                r = max_length - (di + w_size + 1)
+            else:
+                r = 2 * w_size + 1
+            decoder_out, decoder_hidden, decoder_attention = decoder(decoder_inp, decoder_hidden,
+                                                                        encoder_outputs[:, window_l:window_r, :],
+                                                                        (l, r))
+            decoder_attentions[di] = decoder_attention.data
+            topv, topi = decoder_out.topk(1, dim=1)
+            decoder_inp = topi.squeeze().detach().reshape((-1, 1))
+
             if topi.item() == EOS_index:
                 decoded_words.append(EOS_token)
                 break
             else:
                 decoded_words.append(tgt_vocab.index2word[topi.item()])
-
-            decoder_input = topi.squeeze().detach()
 
         return decoded_words, decoder_attentions[:di + 1]
 
@@ -352,10 +400,11 @@ def translate(encoder, decoder, sentence, src_vocab, tgt_vocab, max_length=MAX_L
 ######################################################################
 
 # Translate (dev/test)set takes in a list of sentences and writes out their transaltes
-def translate_sentences(encoder, decoder, pairs, src_vocab, tgt_vocab, max_num_sentences=None, max_length=MAX_LENGTH):
+def translate_sentences(encoder, decoder, pairs, src_vocab, tgt_vocab, w_size, max_num_sentences=None,
+                        max_length=MAX_LENGTH):
     output_sentences = []
     for pair in pairs[:max_num_sentences]:
-        output_words, attentions = translate(encoder, decoder, pair[0], src_vocab, tgt_vocab)
+        output_words, attentions = translate(encoder, decoder, pair[0], src_vocab, tgt_vocab, w_size)
         output_sentence = ' '.join(output_words)
         output_sentences.append(output_sentence)
     return output_sentences
@@ -365,13 +414,12 @@ def translate_sentences(encoder, decoder, pairs, src_vocab, tgt_vocab, max_num_s
 # We can translate random sentences  and print out the
 # input, target, and output to make some subjective quality judgements:
 #
-
-def translate_random_sentence(encoder, decoder, pairs, src_vocab, tgt_vocab, n=1):
+def translate_random_sentence(encoder, decoder, pairs, src_vocab, tgt_vocab, w_size, n=1):
     for i in range(n):
         pair = random.choice(pairs)
         print('>', pair[0])
         print('=', pair[1])
-        output_words, attentions = translate(encoder, decoder, pair[0], src_vocab, tgt_vocab)
+        output_words, attentions = translate(encoder, decoder, pair[0], src_vocab, tgt_vocab, w_size)
         output_sentence = ' '.join(output_words)
         print('<', output_sentence)
         print('')
@@ -379,36 +427,26 @@ def translate_random_sentence(encoder, decoder, pairs, src_vocab, tgt_vocab, n=1
 
 ######################################################################
 
-def show_attention(input_sentence, output_words, attentions, n):
+def show_attention(input_sentence, output_words, attentions, fig, ax):
     """visualize the attention mechanism. And save it to a file.
     Plots should look roughly like this: https://i.stack.imgur.com/PhtQi.png
     You plots should include axis labels and a legend.
     you may want to use matplotlib.
     """
-    fig = plt.figure()
-    ax = fig.add_subplot(111)
-    cax = ax.matshow(attentions.cpu().numpy(), cmap='bone')
-    fig.colorbar(cax)
 
-    # Set up axes
-    ax.set_xticklabels([''] + input_sentence.split(' ') +
-                       ['<EOS>'], rotation=90)
+    ax.matshow(attentions.numpy(), cmap='bone')
+
+    ax.set_xticklabels([''] + input_sentence.split(' ') + ['<EOS>'], rotation=90)
     ax.set_yticklabels([''] + output_words)
 
-    # Show label at every tick
-    ax.xaxis.set_major_locator(ticker.MultipleLocator(1))
-    ax.yaxis.set_major_locator(ticker.MultipleLocator(1))
-    plt.savefig(f'{n}attention_plot.png')
     plt.show()
-    # raise NotImplementedError
 
-
-def translate_and_show_attention(input_sentence, encoder1, decoder1, src_vocab, tgt_vocab, n):
+def translate_and_show_attention(input_sentence, encoder1, decoder1, src_vocab, tgt_vocab, w_size, fig, ax):
     output_words, attentions = translate(
-        encoder1, decoder1, input_sentence, src_vocab, tgt_vocab)
+        encoder1, decoder1, input_sentence, src_vocab, tgt_vocab, w_size)
     print('input =', input_sentence)
     print('output =', ' '.join(output_words))
-    show_attention(input_sentence, output_words, attentions, n)
+    show_attention(input_sentence, output_words, attentions, fig, ax)
 
 
 def clean(strx):
@@ -416,7 +454,7 @@ def clean(strx):
     input: string with bpe, EOS
     output: list without bpe, EOS
     """
-    return ' '.join(strx.replace('@@ ', '').replace(EOS_token, '').replace(SOS_token, '').strip().split())
+    return ' '.join(strx.replace('@@ ', '').replace(EOS_token, '').strip().split())
 
 
 ######################################################################
@@ -425,13 +463,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--hidden_size', default=256, type=int,
                     help='hidden size of encoder/decoder, also word vector size')
-    ap.add_argument('--n_iters', default=500000, type=int,
+    ap.add_argument('--n_iters', default=100000, type=int,
                     help='total number of examples to train on')
-    ap.add_argument('--print_every', default=1000, type=int,
+    ap.add_argument('--print_every', default=100, type=int,
                     help='print loss info every this many training examples')
     ap.add_argument('--checkpoint_every', default=1000, type=int,
                     help='write out checkpoint every this many training examples')
-    ap.add_argument('--initial_learning_rate', default=0.0001, type=float,
+    ap.add_argument('--initial_learning_rate', default=0.001, type=int,
                     help='initial learning rate')
     ap.add_argument('--src_lang', default='fr',
                     help='Source (input) language code, e.g. "fr"')
@@ -447,10 +485,17 @@ def main():
                     help='test file. each line should have a source sentence,' +
                          'followed by "|||", followed by a target sentence' +
                          ' (for test, target is ignored)')
-    ap.add_argument('--out_file', default='out2.txt',
+    ap.add_argument('--batch_size', default=256, type=int,
+                    help='batch size for the mini batches')
+    ap.add_argument('--w_size', default=3, type=int,
+                    help='window size for local attn')
+    ap.add_argument('--out_file', default='out.txt',
                     help='output file for test translations')
+
     ap.add_argument('--load_checkpoint', nargs=1,
                     help='checkpoint file to start from')
+    ap.add_argument('--fig', default='output.png',
+                    help='output figure for attention')
 
     args = ap.parse_args()
 
@@ -469,10 +514,10 @@ def main():
                                            args.tgt_lang,
                                            args.train_file)
 
-    encoder = EncoderRNN(src_vocab.n_words, args.hidden_size).to(device)
-    decoder = AttnDecoderRNN(args.hidden_size, tgt_vocab.n_words, dropout_p=0.1).to(device)
+    encoder = EncoderRNN(src_vocab.n_words, args.hidden_size, args.batch_size).to(device)
+    decoder = AttnDecoderRNN(args.hidden_size, tgt_vocab.n_words, D=args.w_size, dropout_p=0.1).to(device)
 
-    # encoder/decoder weights are randomly initilized
+    # encoder/decoder weights are randomly initialized
     # if checkpointed, load saved weights
     if args.load_checkpoint is not None:
         encoder.load_state_dict(state['enc_state'])
@@ -485,7 +530,7 @@ def main():
 
     # set up optimization/loss
     params = list(encoder.parameters()) + list(decoder.parameters())  # .parameters() returns generator
-    optimizer = optim.AdamW(params, lr=args.initial_learning_rate)
+    optimizer = optim.Adam(params, lr=args.initial_learning_rate)
     criterion = nn.NLLLoss()
 
     # optimizer may have state
@@ -496,19 +541,14 @@ def main():
     start = time.time()
     print_loss_total = 0  # Reset every args.print_every
 
-    while iter_num < args.n_iters:
-        if iter_num % 100 == 0:
-            print('iter_num:', iter_num)
+    for _ in tqdm(range(args.n_iters)):
         iter_num += 1
-        training_pair = tensors_from_pair(src_vocab, tgt_vocab, random.choice(train_pairs))
-        input_tensor = training_pair[0]
-        target_tensor = training_pair[1]
-        loss = train(input_tensor, target_tensor, encoder,
-                     decoder, optimizer, criterion)
-        print_loss_total += loss
 
-        # if iter_num % 100 == 0:
-        #   print("Iterations done: ", iter_num)
+        input_batch, target_batch = mini_batching(args.batch_size, train_pairs, src_vocab, tgt_vocab)
+
+        loss = train(input_batch, target_batch, encoder, decoder, optimizer, criterion, args.w_size)
+
+        print_loss_total += loss
 
         if iter_num % args.checkpoint_every == 0:
             state = {'iter_num': iter_num,
@@ -518,7 +558,7 @@ def main():
                      'src_vocab': src_vocab,
                      'tgt_vocab': tgt_vocab,
                      }
-            filename = 'statey_%010d.pt' % iter_num
+            filename = 'state_%010d.pt' % iter_num
             torch.save(state, filename)
             logging.debug('wrote checkpoint to %s', filename)
 
@@ -531,8 +571,9 @@ def main():
                          iter_num / args.n_iters * 100,
                          print_loss_avg)
             # translate from the dev set
-            translate_random_sentence(encoder, decoder, dev_pairs, src_vocab, tgt_vocab, n=2)
-            translated_sentences = translate_sentences(encoder, decoder, dev_pairs, src_vocab, tgt_vocab)
+            translate_random_sentence(encoder, decoder, dev_pairs, src_vocab, tgt_vocab, args.w_size, n=2)
+            translated_sentences = translate_sentences(encoder, decoder, dev_pairs, src_vocab, tgt_vocab,
+                                                       args.w_size)
 
             references = [[clean(pair[1]).split(), ] for pair in dev_pairs[:len(translated_sentences)]]
             candidates = [clean(sent).split() for sent in translated_sentences]
@@ -540,22 +581,19 @@ def main():
             logging.info('Dev BLEU score: %.2f', dev_bleu)
 
     # translate test set and write to file
-    translated_sentences = translate_sentences(encoder, decoder, dev_pairs, src_vocab, tgt_vocab)
-    references = [[clean(pair[1]).split(), ] for pair in dev_pairs[:len(translated_sentences)]]
-    candidates = [clean(sent).split() for sent in translated_sentences]
-    dev_bleu = corpus_bleu(references, candidates)
-    logging.info('Dev BLEU score: %.2f', dev_bleu)
-
-    translated_sentences = translate_sentences(encoder, decoder, test_pairs, src_vocab, tgt_vocab)
+    translated_sentences = translate_sentences(encoder, decoder, test_pairs, src_vocab, tgt_vocab, args.w_size)
     with open(args.out_file, 'wt', encoding='utf-8') as outf:
         for sent in translated_sentences:
             outf.write(clean(sent) + '\n')
 
     # Visualizing Attention
-    translate_and_show_attention("on p@@ eu@@ t me faire confiance .", encoder, decoder, src_vocab, tgt_vocab, 1)
-    translate_and_show_attention("j en suis contente .", encoder, decoder, src_vocab, tgt_vocab, 2)
-    translate_and_show_attention("vous etes tres genti@@ ls .", encoder, decoder, src_vocab, tgt_vocab, 3)
-    translate_and_show_attention("c est mon hero@@ s ", encoder, decoder, src_vocab, tgt_vocab, 4)
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2)
+    translate_and_show_attention("on p@@ eu@@ t me faire confiance .", encoder, decoder, src_vocab, tgt_vocab, args.w_size, fig, ax1)
+    translate_and_show_attention("j en suis contente .", encoder, decoder, src_vocab, tgt_vocab, args.w_size, fig, ax2)
+    translate_and_show_attention("vous etes tres genti@@ ls .", encoder, decoder, src_vocab, tgt_vocab, args.w_size, fig, ax3)
+    translate_and_show_attention("c est mon hero@@ s ", encoder, decoder, src_vocab, tgt_vocab, args.w_size, fig, ax4)
+
+    plt.savefig(args.fig)
 
 
 if __name__ == '__main__':

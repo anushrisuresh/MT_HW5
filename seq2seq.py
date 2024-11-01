@@ -48,8 +48,6 @@ def indexes_from_sentence(vocab, sentence):
     return [vocab.word2index.get(word, 0) for word in sentence.split()] + [EOS_index]
 
 
-# import genism
-
 class Vocab:
     """ This class handles the mapping between the words and their indicies
     """
@@ -102,9 +100,33 @@ def split_lines(input_file):
     return pairs
 
 
+def check_vocab_mappings(vocab):
+    # Check special tokens
+    if vocab.index2word.get(SOS_index) != SOS_token or vocab.index2word.get(EOS_index) != EOS_token:
+        print(f"Error: Special tokens mismatch! Expected {SOS_token} at index {SOS_index} and {EOS_token} at index {EOS_index}.")
+    else:
+        print("Special tokens correctly mapped.")
+
+    # Check completeness and consistency of vocab mappings
+    missing_words = []
+    for i in range(vocab.n_words):
+        word = vocab.index2word.get(i)
+        if word is None:
+            missing_words.append(i)
+
+    if missing_words:
+        print(f"Error: Missing words at indices: {missing_words}")
+    else:
+        print("All vocabulary indices correctly mapped.")
+    
+    # Print a sample of mappings for inspection
+    print("Sample mappings from index2word:")
+    for i in range(min(50, vocab.n_words)):  # Limit to first 10 words for brevity
+        print(f"Index {i}: {vocab.index2word[i]}")
+
+
 def make_vocabs(src_lang_code, tgt_lang_code, train_file):
-    """ Creates the vocabs for each of the langues based on the training corpus.
-    """
+    """ Creates the vocabs for each of the languages based on the training corpus. """
     src_vocab = Vocab(src_lang_code)
     tgt_vocab = Vocab(tgt_lang_code)
 
@@ -116,6 +138,9 @@ def make_vocabs(src_lang_code, tgt_lang_code, train_file):
 
     logging.info('%s (src) vocab size: %s', src_vocab.lang_code, src_vocab.n_words)
     logging.info('%s (tgt) vocab size: %s', tgt_vocab.lang_code, tgt_vocab.n_words)
+    
+    # Call the check function to verify mappings
+    check_vocab_mappings(tgt_vocab)
 
     return src_vocab, tgt_vocab
 
@@ -201,22 +226,24 @@ def prepare_batch_data(pairs, src_vocab, tgt_vocab, batch_size):
 
     return input_tensor, input_lengths, target_tensor, target_lengths
 
+
 class EncoderRNN(nn.Module):
     def __init__(self, input_size, hidden_size):
         super(EncoderRNN, self).__init__()
         self.hidden_size = hidden_size
         self.embedding = nn.Embedding(input_size, hidden_size)
-        self.gru = nn.GRU(hidden_size, hidden_size, batch_first=True)  # Using batch_first for batches
+        self.gru = nn.GRU(hidden_size, hidden_size, batch_first=True)
 
     def forward(self, input_seqs, input_lengths, hidden=None):
         embedded = self.embedding(input_seqs)
         packed = torch.nn.utils.rnn.pack_padded_sequence(embedded, input_lengths, batch_first=True, enforce_sorted=False)
         outputs, hidden = self.gru(packed, hidden)
-        outputs, _ = torch.nn.utils.rnn.pad_packed_sequence(outputs, batch_first=True)  # unpack back to padded
+        outputs, _ = torch.nn.utils.rnn.pad_packed_sequence(outputs, batch_first=True)
         return outputs, hidden
 
     def get_initial_hidden_state(self, batch_size=1):
         return torch.zeros(1, batch_size, self.hidden_size, device=device)
+
 
 
 
@@ -231,17 +258,15 @@ class BahdanauAttention(nn.Module):
         # query: [batch_size, hidden_size]
         # keys: [batch_size, seq_len, hidden_size]
         scores = self.Va(torch.tanh(self.Wa(query).unsqueeze(1) + self.Ua(keys))).squeeze(-1)
-        weights = F.softmax(scores, dim=1)  # normalize scores
-        context = torch.bmm(weights.unsqueeze(1), keys).squeeze(1)  # context shape [batch_size, hidden_size]
+        weights = F.softmax(scores, dim=1)
+        context = torch.bmm(weights.unsqueeze(1), keys).squeeze(1)
         return context, weights
-
 
 class AttnDecoderRNN(nn.Module):
     def __init__(self, hidden_size, output_size, dropout_p=0.1, max_length=MAX_LENGTH):
         super(AttnDecoderRNN, self).__init__()
         self.hidden_size = hidden_size
         self.output_size = output_size
-        self.dropout_p = dropout_p
         self.embedding = nn.Embedding(output_size, hidden_size)
         self.dropout = nn.Dropout(dropout_p)
         self.attention = BahdanauAttention(hidden_size)
@@ -249,18 +274,17 @@ class AttnDecoderRNN(nn.Module):
         self.out = nn.Linear(hidden_size, output_size)
 
     def forward(self, input, hidden, encoder_outputs):
-        # input: [batch_size, 1]
-        # hidden: [1, batch_size, hidden_size]
-        # encoder_outputs: [batch_size, seq_len, hidden_size]
         embedded = self.dropout(self.embedding(input))
-        context, attn_weights = self.attention(hidden[-1], encoder_outputs)  # Pass last hidden state to attention
+        context, attn_weights = self.attention(hidden[-1], encoder_outputs)
         gru_input = torch.cat((embedded.squeeze(1), context), dim=1).unsqueeze(1)
         output, hidden = self.gru(gru_input, hidden)
-        output = self.out(output.squeeze(1))
+        output = F.log_softmax(self.out(output.squeeze(1)), dim=1)
         return output, hidden, attn_weights
 
-    def get_initial_hidden_state(self):
-        return torch.zeros(1, self.hidden_size, device=device)
+    def get_initial_hidden_state(self, batch_size):
+        return torch.zeros(1, batch_size, self.hidden_size, device=device)
+
+
 
 
 ######################################################################
@@ -391,7 +415,7 @@ def clean(strx):
     """
     return ' '.join(strx.replace('@@ ', '').replace(EOS_token, '').replace(SOS_token, '').strip().split())
 
-def train_batch(input_tensor, target_tensor, input_lengths, target_lengths, encoder, decoder, optimizer, criterion):
+def train_batch(input_tensor, target_tensor, input_lengths, target_lengths, encoder, decoder, optimizer, criterion, teacher_forcing_ratio=0.5):
     encoder.train()
     decoder.train()
 
@@ -399,14 +423,26 @@ def train_batch(input_tensor, target_tensor, input_lengths, target_lengths, enco
     encoder_hidden = encoder.get_initial_hidden_state(batch_size)
     encoder_outputs, encoder_hidden = encoder(input_tensor, input_lengths, encoder_hidden)
 
+    # Initialize decoder input with <SOS> token
     decoder_input = torch.tensor([[SOS_index] * batch_size], device=device).transpose(0, 1)
+    # print("Initial decoder input (should be all <SOS>):", decoder_input)  # Debugging line to check <SOS> token
+
     decoder_hidden = encoder_hidden
+    use_teacher_forcing = random.random() < teacher_forcing_ratio
+
     all_decoder_outputs = torch.zeros(target_tensor.size(1), batch_size, decoder.output_size, device=device)
 
-    for t in range(target_tensor.size(1)):
-        decoder_output, decoder_hidden, _ = decoder(decoder_input, decoder_hidden, encoder_outputs)
-        all_decoder_outputs[t] = decoder_output
-        decoder_input = target_tensor[:, t].unsqueeze(1)  # Teacher forcing
+    if use_teacher_forcing:
+        for t in range(target_tensor.size(1)):
+            decoder_output, decoder_hidden, _ = decoder(decoder_input, decoder_hidden, encoder_outputs)
+            all_decoder_outputs[t] = decoder_output
+            decoder_input = target_tensor[:, t].unsqueeze(1)  # Teacher forcing
+    else:
+        for t in range(target_tensor.size(1)):
+            decoder_output, decoder_hidden, _ = decoder(decoder_input, decoder_hidden, encoder_outputs)
+            all_decoder_outputs[t] = decoder_output
+            topv, topi = decoder_output.topk(1)
+            decoder_input = topi.detach()
 
     # Calculate loss
     loss = criterion(all_decoder_outputs.view(-1, decoder.output_size), target_tensor.view(-1))
@@ -414,6 +450,8 @@ def train_batch(input_tensor, target_tensor, input_lengths, target_lengths, enco
     loss.backward()
     optimizer.step()
     return loss.item()
+
+
 
 
 ######################################################################
