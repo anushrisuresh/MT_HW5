@@ -279,8 +279,6 @@ def main():
             nn.init.xavier_uniform_(p)
     transformer = transformer.to(DEVICE)
 
-    # Define loss function
-    loss_fn = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
 
     optimizer = torch.optim.Adam(transformer.parameters(), lr=0.0001, betas=(0.9, 0.98), eps=1e-9)
 
